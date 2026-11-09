@@ -361,6 +361,59 @@ def test_causal_clc_cells(changes, clc, registers):
         assert config.registers == registers
 
 
+_SM110_FP8 = dict(device_arch=110, num_sms=20, dtype="torch.float8_e4m3fn", num_heads=32,
+                  num_heads_kv=8)
+_SM110_FP8_DECODE = dict(_SM110_FP8, batch_size=1, max_seqlen_q=1, total_q=1,
+                         max_seqlen_k=16384, total_k=16384, requested_num_splits=None,
+                         has_seqused_k=True, page_size=128)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        # Non-causal d128: 1CTA with contiguous KV, 2CTA with page-128 KV; hardware exp2 either way.
+        ({**_SM110_FP8, **_HD128},
+         dict(use_2cta_instrs=False, ex2_emu_freq=0, ex2_emu_start_frg=0)),
+        ({**_SM110_FP8, **_HD128, "has_seqused_k": True, "page_size": 128},
+         dict(use_2cta_instrs=True, ex2_emu_freq=0,
+              registers=Sm100Registers(softmax=168, correction=96, other=80))),
+        # hd256 keeps 2CTA; emulation starts at the third fragment.
+        ({**_SM110_FP8, **_HD256, "num_heads": 24, "num_heads_kv": 4},
+         dict(use_2cta_instrs=True, ex2_emu_freq=24, ex2_emu_start_frg=2)),
+        # Causal runs on CLC, also with page-128 KV, but not with cp.async paged KV.
+        ({**_SM110_FP8, **_HD128, "causal": True},
+         dict(use_clc_scheduler=True, ex2_emu_freq=24, ex2_emu_start_frg=2)),
+        ({**_SM110_FP8, **_HD128, "causal": True, "has_seqused_k": True, "page_size": 128},
+         dict(use_clc_scheduler=True)),
+        ({**_SM110_FP8, **_HD128, "causal": True, "has_seqused_k": True, "page_size": 16},
+         dict(use_clc_scheduler=False)),
+        ({**_SM110_FP8, **_HD256, "causal": True, "num_heads": 24, "num_heads_kv": 4},
+         dict(use_clc_scheduler=True, use_2cta_instrs=True)),
+        # Decode: whole waves of 20 SMs (8 KV heads x 5 splits), spill-free registers, ping-pong.
+        ({**_SM110_FP8_DECODE, **_HD128},
+         dict(num_splits=5, use_s_ping_pong=True,
+              registers=Sm100Registers(softmax=208, correction=128, other=88))),
+        # Short KV keeps the one-wave count.
+        ({**_SM110_FP8_DECODE, **_HD128, "max_seqlen_k": 4096, "total_k": 4096},
+         dict(num_splits=2, use_s_ping_pong=True)),
+        ({**_SM110_FP8_DECODE, **_HD256, "num_heads": 24, "num_heads_kv": 4},
+         dict(num_splits=5, use_s_ping_pong=True,
+              registers=Sm100Registers(softmax=192, correction=160, other=80))),
+        ({**_SM110_FP8_DECODE, **_HD256, "num_heads": 24, "num_heads_kv": 4,
+          "max_seqlen_k": 131072, "total_k": 131072}, dict(num_splits=2)),
+        # Unsplit hd128 decode uses a two-stage KV ring.
+        ({**_SM110_FP8_DECODE, **_HD128, "batch_size": 16, "total_q": 16, "total_k": 16 * 16384},
+         dict(num_splits=1, kv_stage=2)),
+        # BF16 on SM110 keeps the SM100 policy.
+        ({**_SM110_FP8, **_HD128, "dtype": "torch.bfloat16"},
+         dict(use_2cta_instrs=True, ex2_emu_freq=10, ex2_emu_start_frg=1)),
+    ],
+)
+def test_sm110_fp8_policy(changes, expected):
+    config = select_fwd_config(make_inputs(**changes))
+    assert {k: getattr(config, k) for k in expected} == expected
+
+
 @pytest.mark.parametrize(
     ("changes", "use_clc_scheduler", "registers"),
     [
@@ -562,10 +615,13 @@ _ELEMENT_BYTES = {"torch.bfloat16": 2, "torch.float8_e4m3fn": 1}
 
 
 def test_sm100_registers_match_the_legacy_kernel_policy():
+    # SM110 FP8 has its own measured tables (test_sm110_fp8_policy); SM110 BF16 still matches.
     for device_arch, dtype, d, causal, use_2cta, page, q_stage in itertools.product(
         [100, 103, 110], ["torch.bfloat16", "torch.float8_e4m3fn"], [64, 80, 96, 128, 192, 256],
         [False, True], [False, True], [None, 64], [1, 2],
     ):
+        if device_arch == 110 and "float8" in dtype:
+            continue
         inputs = make_inputs(device_arch=device_arch, dtype=dtype, head_dim=d, head_dim_v=d,
                              causal=causal, page_size=page)
         got = select_registers(inputs, tile_m=128, tile_n=128, q_stage=q_stage,

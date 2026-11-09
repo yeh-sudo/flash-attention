@@ -379,6 +379,51 @@ SM100_FP8_SMALL_HDIM_REGISTERS = {
     False: Sm100Registers(softmax=168, correction=96, other=80),
     True: Sm100Registers(softmax=152, correction=96, other=112),
 }
+# SM110 (Jetson Thor) runs the SM100 forward kernel with its own FP8 tables, so Thor tuning
+# never reaches SM100/SM103/SM107. Keys and values have the SM100 layouts above (is_sm103 is
+# always False on SM110). Untuned fields fall back to SM100_TUNING, as on SM100.
+SM110_FP8_TUNING = {
+    # Measured on Jetson Thor (20 SMs, GPC 1062 MHz) with agent_space-style interleaved CUDA-graph
+    # A/B runs against the SM100 values. FP8 rescales O on most KV tiles (rescale_threshold = 0),
+    # and those FMULs share the FMA pipe with emulated exp2, so non-causal d128/d192 run fastest on
+    # hardware exp2: 2CTA page-128 1.24-1.30x (d128) and 1.08-1.10x (d192) with softmax 168 /
+    # correction 96, 1CTA contiguous (sm110_fp8_prefers_1cta) 1.14-1.15x and 1.09-1.10x.
+    (True, False, 128, False): {
+        "ex2_emu_freq": 0,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 168,
+        "num_regs_correction": 96,
+    },
+    (False, False, 128, False): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0},
+    (True, False, 192, False): {
+        "ex2_emu_freq": 0,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 168,
+        "num_regs_correction": 96,
+    },
+    # d64 and d256 keep emulation but start it one fragment later and on every 24th pair:
+    # 1.06-1.11x (d64), 1.05-1.07x (d256 2CTA).
+    (False, False, 64, False): {"ex2_emu_freq": 24, "ex2_emu_start_frg": 2},
+    (True, False, 256, False): {"ex2_emu_freq": 24, "ex2_emu_start_frg": 2},
+    # Causal runs on CLC (sm_110 cells of _CAUSAL_CLC_DEFAULT); with it, starting emulation one
+    # fragment later measured 1.12-1.49x over the SM100 values on 23 shapes (d64 16/2, d128 24/2,
+    # d192 32/2, d256 2CTA 24/2).
+    (False, True, 64, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 2},
+    (False, True, 128, False): {"ex2_emu_freq": 24, "ex2_emu_start_frg": 2},
+    (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 2},
+    (True, True, 256, False): {"ex2_emu_freq": 24, "ex2_emu_start_frg": 2},
+}
+SM110_FP8_SMALL_HDIM_REGISTERS = {
+    False: Sm100Registers(softmax=168, correction=96, other=80),
+    True: Sm100Registers(softmax=152, correction=96, other=112),
+}
+# SM110 FP8 SplitKV decode (q_stage 1) stores O from the correction warps (no TMA O). At the
+# default correction budget (72-80) that epilogue spills: 208 B stack at dv 128, 416 B at dv 256.
+# These splits are spill-free and measured 1.01-1.08x (dv 128) and 1.5x (dv 256) faster on Thor.
+SM110_FP8_SPLITKV_REGISTERS = {
+    128: Sm100Registers(softmax=208, correction=128, other=88),
+    256: Sm100Registers(softmax=192, correction=160, other=80),
+}
 # === END SM100 TUNING KNOBS ===
 
 # 16 warps: two softmax, correction, MMA, load, epilogue, and an empty warp group.
@@ -390,6 +435,105 @@ SM100_LAUNCH_REGISTERS = 65536 // SM100_THREADS_PER_CTA
 def sm100_is_sm103_family(device_arch: int) -> bool:
     """Match the kernel's ``Arch.is_family_of(sm_103f)``: SM10x with minor version >= 3."""
     return device_arch // 10 == 10 and device_arch % 10 >= 3
+
+
+def sm100_is_sm110(device_arch: int) -> bool:
+    """SM110 (Jetson Thor): runs the SM100 forward kernel, with its own tuning tables."""
+    return device_arch // 10 == 11
+
+
+def sm100_fp8_tables(device_arch: int) -> tuple[dict, dict]:
+    """(FP8 tuning, FP8 small-head-dim registers) for one SM100-family architecture."""
+    if sm100_is_sm110(device_arch):
+        return SM110_FP8_TUNING, SM110_FP8_SMALL_HDIM_REGISTERS
+    return SM100_FP8_TUNING, SM100_FP8_SMALL_HDIM_REGISTERS
+
+
+def sm110_fp8_splitkv_registers(
+    inputs: FwdHeuristicInputs, *, q_stage: int, num_splits: int
+) -> Sm100Registers | None:
+    """Spill-free register split for SM110 FP8 SplitKV decode, or None to use the defaults."""
+    if (
+        not sm100_is_sm110(inputs.device_arch)
+        or "float8" not in inputs.dtype
+        or q_stage != 1
+        or num_splits == 1
+        or inputs.head_dim_padded != inputs.head_dim_v_padded
+    ):
+        return None
+    return SM110_FP8_SPLITKV_REGISTERS.get(inputs.head_dim_padded)
+
+
+def sm110_fp8_prefers_1cta(inputs: FwdHeuristicInputs) -> bool:
+    """SM110 FP8 2CTA-eligible d128/d192 with contiguous KV: 1CTA measured 1.09-1.15x faster.
+
+    With page-128 KV, 2CTA stays faster, and hd256 keeps 2CTA (1CTA measured 0.84-1.01x).
+    """
+    return (
+        sm100_is_sm110(inputs.device_arch)
+        and "float8" in inputs.dtype
+        and not inputs.is_hdim256
+        and inputs.page_size is None
+    )
+
+
+def sm110_fp8_split_decode(inputs: FwdHeuristicInputs) -> bool:
+    """SM110 FP8 single-token decode with TMA KV, the class the SM110 split and ping-pong rules
+    cover. Paged KV without TMA (page size other than the 128-token tile) measured slower with
+    more splits (0.75-0.94x at 128K tokens) and cannot use S ping-pong."""
+    return (
+        sm100_is_sm110(inputs.device_arch)
+        and "float8" in inputs.dtype
+        and inputs.max_seqlen_q == 1
+        and inputs.head_dim == inputs.head_dim_v
+        and inputs.head_dim in (64, 128, 256)
+        and inputs.page_size in (None, 128)
+    )
+
+
+def sm110_fp8_decode_num_splits(
+    inputs: FwdHeuristicInputs, *, num_splits: int, total_mblocks: int, num_n_blocks: int
+) -> int:
+    """Automatic SplitKV count for SM110 FP8 single-token decode that already splits.
+
+    num_splits_heuristic fills each SM once (20 // tiles, e.g. 2 splits for 8 KV heads). On
+    Thor the split count that fills whole waves of SMs measured faster from 64 KV blocks on at
+    hd64/hd128 (5 splits for 8 KV heads: 1.03-1.20x over 2 splits, S ping-pong and the spill-free
+    split registers on), while at hd256 from 256 KV blocks two splits beat the one-wave count
+    (1.15-1.23x over 5 splits at 32K-128K tokens).
+    """
+    if not sm110_fp8_split_decode(inputs) or total_mblocks == 0:
+        return num_splits
+    if inputs.head_dim == 256:
+        return 2 if num_n_blocks >= 256 else num_splits
+    if num_n_blocks < 64:
+        return num_splits
+    wave_splits = next(
+        (s for s in range(num_splits, 9) if total_mblocks * s % inputs.num_sms == 0), num_splits
+    )
+    return min(wave_splits, num_n_blocks)
+
+
+def sm110_fp8_shallow_kv_ring(
+    inputs: FwdHeuristicInputs, *, tile_n: int, q_stage: int, num_splits: int, use_2cta_instrs: bool
+) -> bool:
+    """SM110 FP8 hd128 single-token decode without SplitKV, TMA KV: two KV stages.
+
+    On Thor the default 10-11 stage ring measured 1.04-1.24x slower than two stages on 13
+    batch 2-64 shapes (contiguous and page-128 KV); split batch-1 decode is mixed and page-16
+    (cp.async) KV slower, so both keep the full ring.
+    """
+    return (
+        sm100_is_sm110(inputs.device_arch)
+        and "float8" in inputs.dtype
+        and inputs.head_dim_padded == 128
+        and inputs.head_dim_v_padded == 128
+        and inputs.max_seqlen_q == 1
+        and q_stage == 1
+        and num_splits == 1
+        and not use_2cta_instrs
+        and inputs.page_size in (None, tile_n)
+    )
 
 
 def select_sm100_registers(
@@ -404,10 +548,11 @@ def select_sm100_registers(
         sm100_is_sm103_family(inputs.device_arch),
     )
     is_fp8 = "float8" in inputs.dtype
+    fp8_tuning, fp8_small_hdim_registers = sm100_fp8_tables(inputs.device_arch)
     if head_dim_padded < 96:
-        small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
+        small = fp8_small_hdim_registers if is_fp8 else SM100_SMALL_HDIM_REGISTERS
         return small[paged_kv_non_tma]
-    fp8_tune = SM100_FP8_TUNING.get(key, {}) if is_fp8 else {}
+    fp8_tune = fp8_tuning.get(key, {}) if is_fp8 else {}
     if not paged_kv_non_tma and "num_regs_softmax" in fp8_tune:
         softmax, correction = fp8_tune["num_regs_softmax"], fp8_tune["num_regs_correction"]
         return Sm100Registers(softmax, correction, 512 - softmax * 2 - correction)
@@ -439,7 +584,8 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     is_sm103 = sm100_is_sm103_family(inputs.device_arch)
     key = (use_2cta_instrs, inputs.causal, head_dim_padded, is_sm103)
     tune = SM100_TUNING.get(key, {})
-    fp8_tune = SM100_FP8_TUNING.get(key, {}) if "float8" in inputs.dtype else {}
+    fp8_tuning, _ = sm100_fp8_tables(inputs.device_arch)
+    fp8_tune = fp8_tuning.get(key, {}) if "float8" in inputs.dtype else {}
     if "ex2_emu_freq" in fp8_tune:
         tune = {**tune, **fp8_tune}
     start_frg = tune.get("ex2_emu_start_frg", 1)
@@ -498,6 +644,11 @@ def select_registers(
                 )
                 if clc_registers is not None:
                     return clc_registers
+            splitkv_registers = sm110_fp8_splitkv_registers(
+                inputs, q_stage=q_stage, num_splits=num_splits
+            )
+            if splitkv_registers is not None:
+                return splitkv_registers
             return select_sm100_registers(
                 inputs, tile_n=tile_n, q_stage=q_stage, use_2cta_instrs=use_2cta_instrs
             )
@@ -757,8 +908,10 @@ _CAUSAL_CLC_DEFAULT = {
     ("fp16", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
     ("fp16", 192): {"sm_100": None, "sm_103": None},
     ("fp16", 256): {"sm_100": None},
-    ("fp8", 64): {"sm_100": None, "sm_103": None, "sm_107": None},
-    ("fp8", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("fp8", 64): {"sm_100": None, "sm_103": None, "sm_107": None, "sm_110": None},
+    ("fp8", 128): {"sm_100": None, "sm_103": None, "sm_107": None, "sm_110": None},
+    ("fp8", 192): {"sm_110": None},
+    ("fp8", 256): {"sm_110": None},
 }
 _HD256_CLC_MIN_HEAD_SLICES = 32
 
@@ -771,10 +924,22 @@ def causal_clc_policy(
     An enabled cell with no override keeps the default register split; see NOTE [causal CLC].
     """
     launched_heads = inputs.num_heads_kv if inputs.pack_gqa else inputs.num_heads
+    # Thor (20 SMs) has few tiles per SM even at one batch, so its measured cells also cover
+    # page-128 (TMA) KV and hd256 with fewer head slices: 1.15-1.27x and 1.24-1.49x.
+    sm110 = sm100_is_sm110(inputs.device_arch)
     if (
-        inputs.device_capacity != 10
+        inputs.device_capacity not in (10, 11)
         or not inputs.causal
-        or inputs.is_varlen
+        # SM110 also measured page-128 (TMA) KV, whose seqused_k makes the problem varlen.
+        or (
+            inputs.is_varlen
+            and not (
+                sm110
+                and inputs.page_size == 128
+                and not inputs.is_varlen_q
+                and not inputs.has_cu_seqlens_k
+            )
+        )
         or inputs.local
         or num_splits != 1
         # Measured tiles: two Q tiles per CTA, or one Q tile per 2CTA cluster at hd256.
@@ -783,17 +948,20 @@ def causal_clc_policy(
             inputs.is_hdim256
             and (
                 not use_2cta_instrs
-                or inputs.batch_size * launched_heads < _HD256_CLC_MIN_HEAD_SLICES
+                or (inputs.batch_size * launched_heads < _HD256_CLC_MIN_HEAD_SLICES and not sm110)
             )
         )
-        or inputs.page_size is not None
+        or inputs.page_size not in ((None, 128) if sm110 else (None,))
         or inputs.use_block_sparsity
         or inputs.has_score_mod
         or inputs.has_mask_mod
     ):
         return False, None
-    minor = inputs.device_arch % 10
-    family = "sm_107" if minor >= 7 else "sm_103" if minor >= 3 else "sm_100"
+    if sm100_is_sm110(inputs.device_arch):
+        family = "sm_110"
+    else:
+        minor = inputs.device_arch % 10
+        family = "sm_107" if minor >= 7 else "sm_103" if minor >= 3 else "sm_100"
     dtype = inputs.dtype
     dtype_path = "fp8" if "float8" in dtype else "fp16" if dtype == "torch.float16" else "bf16"
     row = _CAUSAL_CLC_DEFAULT.get((dtype_path, inputs.head_dim_padded), {})
@@ -947,6 +1115,14 @@ def select_sm100_smem_layout(
     )
     q_o = max(q, o) if overlap_sO_sQ else q + o
     kv_stage = min((_SM100_KV_STAGE_BUDGET_BYTES - q_o) // max(k, v), SM100_MAX_KV_STAGE)
+    if sm110_fp8_shallow_kv_ring(
+        inputs,
+        tile_n=tile_n,
+        q_stage=q_stage,
+        num_splits=num_splits,
+        use_2cta_instrs=use_2cta_instrs,
+    ):
+        kv_stage = min(kv_stage, 2)
     # 1CTA hd192/128 fits a third stage with the uneven [K, V, K] layout.
     if sm100_uneven_kv_smem(head_dim_padded, head_dim_v_padded, kv_stage + 1, use_2cta_instrs):
         kv_stage = 3
@@ -1370,6 +1546,9 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         else:
             num_splits = 1
     if inputs.requested_num_splits is None and num_splits > 1:
+        num_splits = sm110_fp8_decode_num_splits(
+            inputs, num_splits=num_splits, total_mblocks=total_mblocks, num_n_blocks=num_n_blocks
+        )
         num_splits = max(num_splits, fixed_seqlen_k_num_splits(inputs))
 
     is_split_kv = num_splits > 1
@@ -1377,6 +1556,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         is_sm100_family
         and not inputs.disable_2cta
         and is_2cta_eligible(inputs, tile_m=tile_m, q_stage=q_stage, num_splits=num_splits)
+        and not sm110_fp8_prefers_1cta(inputs)
     )
 
     tuned = select_tuned_sm100_overrides(
@@ -1426,6 +1606,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             not is_split_kv
             or n_blocks_per_split
             >= _S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT.get(inputs.head_dim, math.inf)
+            or sm110_fp8_split_decode(inputs)
         )
     )
     ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(inputs, use_2cta_instrs=use_2cta_instrs)
